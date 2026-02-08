@@ -274,6 +274,16 @@ class DynamicInferenceRequest(InferenceRequest):
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
+    # Multimodal fields (None for text-only requests).
+    # Pre-computed image embeddings from vision encoder + projection.
+    # Shape: [img_seq_len, total_tiles, h_language]
+    image_embeddings: Optional[torch.Tensor] = None
+    # Ranges within the expanded prompt token sequence that correspond to image embeddings.
+    # Each tuple is (start_idx, end_idx) in the expanded sequence.
+    image_token_positions: Optional[List[Tuple[int, int]]] = None
+    # Whether this request has images (used for chunked prefill / CUDA graph decisions).
+    has_images: bool = False
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
@@ -478,6 +488,10 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            # Carry forward multimodal fields for re-prefill after eviction.
+            image_embeddings=old_request.image_embeddings,
+            image_token_positions=old_request.image_token_positions,
+            has_images=old_request.has_images,
         )
         self.requests.append(new_request)
 

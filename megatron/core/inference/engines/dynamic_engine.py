@@ -783,6 +783,14 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.failed_request_ids.append(request_id)
 
+        # Register image data with the wrapper if this is a VLM request.
+        if request.has_images and request.image_embeddings is not None:
+            wrapper = self.controller.inference_wrapped_model
+            if hasattr(wrapper, "register_image_data"):
+                wrapper.register_image_data(
+                    request_id, request.image_embeddings, request.image_token_positions
+                )
+
         return self.requests[request_id].future
 
     def add_request(
@@ -790,6 +798,8 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        image_embeddings: Optional[Tensor] = None,
+        image_token_index: int = -200,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -797,6 +807,11 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            image_embeddings (Optional[Tensor]): Pre-computed image embeddings from vision
+                encoder + projection, shape [img_seq_len, total_tiles, h_language].
+                If provided, placeholder tokens (image_token_index) in the prompt will be
+                expanded to accommodate these embeddings.
+            image_token_index (int): Token ID used as image placeholder (default -200).
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -827,16 +842,97 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
+        # Expand prompt tokens for image embeddings if provided.
+        has_images = False
+        image_token_positions = None
+        if image_embeddings is not None:
+            tokens, image_token_positions = self._expand_prompt_for_images(
+                tokens, image_embeddings, image_token_index
+            )
+            has_images = True
+
         # Initialize request.
         request = DynamicInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            image_embeddings=image_embeddings,
+            image_token_positions=image_token_positions,
+            has_images=has_images,
         )
 
         # Add request.
         return self._add_request(request)
+
+    @staticmethod
+    def _expand_prompt_for_images(
+        tokens: Tensor,
+        image_embeddings: Tensor,
+        image_token_index: int,
+    ) -> Tuple[Tensor, List[Tuple[int, int]]]:
+        """Expand prompt tokens by replacing image placeholders with dummy tokens.
+
+        Each image placeholder token (image_token_index, default -200) is replaced by
+        (img_seq_len * num_tiles) dummy tokens (value 0). This makes the token sequence
+        length match the true post-vision-merge length that the KV cache will see.
+
+        Args:
+            tokens (Tensor): Original prompt token IDs with image placeholders.
+            image_embeddings (Tensor): Pre-computed embeddings,
+                shape [img_seq_len, total_tiles, h_language].
+            image_token_index (int): The placeholder token ID.
+
+        Returns:
+            expanded_tokens (Tensor): Expanded token sequence with dummy IDs at image positions.
+            image_token_positions (List[Tuple[int, int]]): (start, end) ranges in the expanded
+                sequence for each image placeholder.
+        """
+        img_seq_len = image_embeddings.shape[0]
+        total_tiles = image_embeddings.shape[1]
+
+        # Find placeholder positions.
+        placeholder_mask = tokens == image_token_index
+        num_placeholders = placeholder_mask.sum().item()
+        if num_placeholders == 0:
+            return tokens, []
+
+        # For single-image case (most common), all tiles belong to one placeholder.
+        # For multi-image, tiles are split evenly across placeholders.
+        tiles_per_placeholder = total_tiles // num_placeholders
+        embeddings_per_placeholder = img_seq_len * tiles_per_placeholder
+
+        # Build the expanded token sequence.
+        placeholder_indices = torch.where(placeholder_mask)[0]
+        expanded_parts = []
+        image_token_positions = []
+        prev_idx = 0
+        running_offset = 0
+
+        for i, ph_idx in enumerate(placeholder_indices.tolist()):
+            # Text tokens before this placeholder.
+            if ph_idx > prev_idx:
+                expanded_parts.append(tokens[prev_idx:ph_idx])
+                running_offset += ph_idx - prev_idx
+
+            # Dummy tokens for image embeddings.
+            start_pos = running_offset
+            dummy_tokens = torch.zeros(
+                embeddings_per_placeholder, dtype=tokens.dtype, device=tokens.device
+            )
+            expanded_parts.append(dummy_tokens)
+            running_offset += embeddings_per_placeholder
+            end_pos = running_offset
+            image_token_positions.append((start_pos, end_pos))
+
+            prev_idx = ph_idx + 1  # Skip the placeholder token itself.
+
+        # Remaining text tokens after the last placeholder.
+        if prev_idx < len(tokens):
+            expanded_parts.append(tokens[prev_idx:])
+
+        expanded_tokens = torch.cat(expanded_parts, dim=0)
+        return expanded_tokens, image_token_positions
 
     def post_process_requests(
         self,
@@ -898,6 +994,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
+
+                    # Clean up VLM image data for finished requests.
+                    wrapper = self.controller.inference_wrapped_model
+                    if hasattr(wrapper, "unregister_image_data"):
+                        wrapper.unregister_image_data(request_id)
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
@@ -1144,7 +1245,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     # so that no additional requests are scheduled beyond the chunked
                     # prefill request.
                     can_schedule = not self.context.has_explicit_chunked_prefill_req
-                elif token_partially_can_be_added:
+                elif token_partially_can_be_added and not req.has_images:
+                    # VLM requests with images cannot be chunked because chunk boundaries
+                    # must not split image embedding regions.
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
