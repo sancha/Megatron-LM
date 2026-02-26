@@ -109,6 +109,13 @@ class _ParamAndGradBucket:
             self.param_to_index[param] = (offset, offset + param.numel())
             offset += param.numel()
 
+        # Whether all params in this bucket are encoder params (set via
+        # `is_encoder_param = True` on parameters). Used to apply gradient
+        # correction for partial DP participation in multimodal training.
+        self.is_encoder_bucket = all(
+            getattr(p, "is_encoder_param", False) for p in params
+        )
+
 
 class _ParamAndGradBucketGroup:
     """
@@ -152,6 +159,16 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+
+        # Track whether this bucket group contains encoder buckets that need
+        # gradient correction for partial DP participation.
+        self.has_encoder_buckets = any(bucket.is_encoder_bucket for bucket in self.buckets)
+        # Store the collective group and world size for participation counting.
+        # We always need the collective_group for the participation all-reduce.
+        self.collective_group = collective_group
+        self.collective_group_size = collective_group_size
+        # Pending participation corrections to apply after async reduction completes.
+        self._encoder_participation_counts = {}
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -361,6 +378,61 @@ class _ParamAndGradBucketGroup:
                 if len(fp8_params) > 0:
                     post_all_gather_processing(fp8_params)
 
+    def _compute_encoder_participation(self):
+        """
+        Compute how many DP ranks have non-zero encoder gradients.
+
+        For each encoder bucket, checks if the local gradient data has any non-zero
+        values, then all-reduces a binary indicator across the DP group to get the
+        total number of participating ranks. Results are stored in
+        ``self._encoder_participation_counts`` for later use in correction.
+
+        Must be called BEFORE the main gradient reduction so that local gradient data
+        has not yet been overwritten by the collective.
+        """
+        self._encoder_participation_counts = {}
+        for idx, bucket in enumerate(self.buckets):
+            if not bucket.is_encoder_bucket:
+                continue
+            has_grads = torch.tensor(
+                [1.0 if bucket.grad_data.any() else 0.0],
+                dtype=torch.float32,
+                device=bucket.grad_data.device,
+            )
+            # Synchronous scalar all-reduce (~50us at scale, negligible).
+            torch.distributed.all_reduce(
+                has_grads, op=torch.distributed.ReduceOp.SUM, group=self.collective_group
+            )
+            self._encoder_participation_counts[idx] = has_grads.item()
+
+    def _apply_encoder_grad_correction(self):
+        """
+        Apply post-reduction gradient correction for encoder buckets.
+
+        When only a subset of DP ranks have encoder gradients (e.g., in multimodal
+        training where some ranks get text-only data), the standard all-reduce/
+        reduce-scatter produces ``sum(grads) / dp_size``. This correction rescales
+        to ``sum(grads) / participation_count`` so the encoder gradient reflects the
+        true mean over ranks that had data.
+
+        Must be called AFTER the gradient reduction has completed (synchronous or
+        after async handle.wait()).
+        """
+        if not self.ddp_config.correct_encoder_grad_for_partial_participation:
+            return
+        if not self.has_encoder_buckets:
+            return
+
+        dp_size = float(self.collective_group_size)
+        for idx, bucket in enumerate(self.buckets):
+            if not bucket.is_encoder_bucket:
+                continue
+            participation_count = self._encoder_participation_counts.get(idx, dp_size)
+            if participation_count > 0 and participation_count < dp_size:
+                correction = dp_size / participation_count
+                bucket.grad_data *= correction
+        self._encoder_participation_counts = {}
+
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
@@ -390,6 +462,16 @@ class _ParamAndGradBucketGroup:
         for bucket in self.buckets:
             if bucket.gradient_scaling_factor != 1.0:
                 bucket.grad_data *= bucket.gradient_scaling_factor
+
+        # Compute encoder participation counts before the main reduction overwrites
+        # local gradient data. The participation count is used after the reduction to
+        # correct for gradient dilution from text-only ranks.
+        if self.ddp_config.correct_encoder_grad_for_partial_participation and self.has_encoder_buckets:
+            assert self.ddp_config.num_distributed_optimizer_instances == 1, (
+                "Encoder grad correction is not yet supported with "
+                "num_distributed_optimizer_instances > 1"
+            )
+            self._compute_encoder_participation()
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -517,6 +599,7 @@ class _ParamAndGradBucketGroup:
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
+            self._apply_encoder_grad_correction()
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
@@ -527,6 +610,7 @@ class _ParamAndGradBucketGroup:
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
+            self._apply_encoder_grad_correction()
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -535,6 +619,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        self._apply_encoder_grad_correction()
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -708,14 +793,32 @@ class _ParamAndGradBuffer:
                 and self.ddp_config.use_distributed_optimizer
             )
 
+        def _does_param_cross_encoder_boundary(param):
+            """
+            Check if adding this param to the current bucket would mix encoder and
+            non-encoder parameters. Returns True if the current bucket has params with
+            a different ``is_encoder_param`` status than this param, indicating a bucket
+            boundary is needed to keep encoder params isolated for gradient correction.
+            """
+            if len(bucket_params) == 0:
+                return False
+            param_is_encoder = getattr(param, "is_encoder_param", False)
+            # Check against any existing param in the bucket (they should all agree).
+            existing_param = next(iter(bucket_params))
+            existing_is_encoder = getattr(existing_param, "is_encoder_param", False)
+            return param_is_encoder != existing_is_encoder
+
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
             this_numel = param.data.nelement()
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
-            # Create bucket with collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+            # Create bucket with collected parameters if current param needs its own bucket
+            # or if adding it would mix encoder and non-encoder params.
+            if (
+                _does_param_require_new_bucket(param) or _does_param_cross_encoder_boundary(param)
+            ) and len(bucket_params) > 0:
                 # Ensure this param accounts for the new padding introduced at end of
                 # previous bucket.
                 param_start_index = _update_bucket_metadata(param_start_index)

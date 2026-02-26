@@ -379,6 +379,15 @@ class LLaVAModel(MegatronModule):
         self._tile_tags = tile_tags
         self._max_num_tiles = max_num_tiles
 
+        # Mark vision encoder and projection parameters so they can be placed in
+        # separate gradient reduction buckets. This enables correcting for gradient
+        # dilution when only a subset of DP ranks have image data each step.
+        if self.add_encoder:
+            for param in self.vision_model.parameters():
+                param.is_encoder_param = True
+            for param in self.vision_projection.parameters():
+                param.is_encoder_param = True
+
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
         necessary for `finalize_model_grads._allreduce_word_embedding_grads`."""

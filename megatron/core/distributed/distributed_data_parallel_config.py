@@ -148,6 +148,17 @@ class DistributedDataParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    correct_encoder_grad_for_partial_participation: bool = False
+    """If true, correct vision encoder gradients for partial data-parallel participation.
+    When multimodal data is blended with text-only data, not all DP ranks will have
+    encoder gradients on every step. Without correction, encoder gradients are diluted
+    by averaging over all DP ranks (including those with zero gradients). This flag
+    enables a post-reduction correction that rescales encoder gradients to average over
+    only the ranks that had non-zero gradients, preventing gradient dilution.
+
+    Requires encoder parameters to be marked with `is_encoder_param = True` so they
+    are placed in separate gradient buckets."""
+
     def __post_init__(self):
         import os
 
